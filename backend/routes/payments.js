@@ -1,5 +1,10 @@
 import express from "express";
-import { Transaction, Wallet } from "../data/mongodb.js";
+import {
+  FiatReserve,
+  ReserveTransaction,
+  Transaction,
+  Wallet,
+} from "../data/mongodb.js";
 import { validateCallback } from "../services/lipia.js";
 import {
   convertFiatToStablecoin,
@@ -50,29 +55,165 @@ router.post("/lipia-callback", async (req, res) => {
     const userId = transaction.userId;
 
     if (isSuccess && resultCode === 0) {
-      // Payment successful - update wallet and transaction
-      console.log(`Payment successful for transaction ${externalReference}:`, {
-        amount,
-        mpesaReceiptNumber,
-        phone,
-      });
+      // Payment successful - convert fiat to stablecoin in real-time
+      console.log(
+        `✅ Payment successful for transaction ${externalReference}:`,
+        {
+          amount,
+          mpesaReceiptNumber,
+          phone,
+        }
+      );
 
-      // Update wallet balance
-      const wallet = await Wallet.findOne({ userId });
-      if (wallet) {
-        wallet.balance += transaction.amount;
-        wallet.updatedAt = new Date();
-        await wallet.save();
+      // Get conversion details from transaction metadata
+      const fiatAmount = transaction.metadata?.fiatAmount || amount;
+      const fiatCurrency = transaction.metadata?.fiatCurrency || "KES";
+      const stablecoin =
+        transaction.metadata?.stablecoin || transaction.currency || "USDC";
+
+      // Perform REAL-TIME conversion using current Yellow Card rates
+      console.log(
+        `🟡 Converting ${fiatAmount} ${fiatCurrency} to ${stablecoin} at current rates...`
+      );
+
+      const conversion = await convertFiatToStablecoin(
+        fiatAmount,
+        fiatCurrency,
+        stablecoin
+      );
+
+      if (!conversion.success) {
+        console.error("❌ Real-time conversion failed:", conversion);
+        transaction.status = "failed";
+        transaction.description += ` - Conversion failed`;
+        await transaction.save();
+        return res.status(200).send("ok");
       }
 
-      // Update transaction status
+      const stablecoinAmount = conversion.stablecoinAmount;
+      const realTimeRate = conversion.rate;
+
+      console.log(
+        `💰 Minting ${stablecoinAmount} ${stablecoin} (Rate: ${realTimeRate})`
+      );
+
+      // STEP 1: Add fiat to reserve (M-Pesa till received payment)
+      let fiatReserve = await FiatReserve.findOne({ currency: fiatCurrency });
+      if (!fiatReserve) {
+        // Create reserve if doesn't exist
+        fiatReserve = await FiatReserve.create({
+          currency: fiatCurrency,
+          balance: 0,
+          totalDeposited: 0,
+          totalConverted: 0,
+        });
+      }
+
+      const balanceBefore = fiatReserve.balance;
+
+      // Add fiat to reserve
+      fiatReserve.balance += fiatAmount;
+      fiatReserve.totalDeposited += fiatAmount;
+      fiatReserve.lastActivity = new Date();
+      fiatReserve.updatedAt = new Date();
+      await fiatReserve.save();
+
+      // Log reserve deposit
+      await ReserveTransaction.create({
+        currency: fiatCurrency,
+        type: "deposit",
+        amount: fiatAmount,
+        balanceBefore,
+        balanceAfter: fiatReserve.balance,
+        relatedUserId: userId,
+        relatedTransactionId: transaction._id,
+        description: `M-Pesa deposit received: ${mpesaReceiptNumber}`,
+        metadata: { mpesaReceiptNumber, phone },
+      });
+
+      console.log(
+        `💵 Fiat Reserve: +${fiatAmount} ${fiatCurrency} | Balance: ${fiatReserve.balance} ${fiatCurrency}`
+      );
+
+      // STEP 2: Deduct fiat from reserve (converting to stablecoin)
+      const balanceBeforeConversion = fiatReserve.balance;
+
+      if (fiatReserve.balance < fiatAmount) {
+        console.error(
+          `❌ Insufficient fiat reserve: ${fiatReserve.balance} < ${fiatAmount}`
+        );
+        transaction.status = "failed";
+        transaction.description += ` - Insufficient fiat reserve`;
+        await transaction.save();
+        return res.status(200).send("ok");
+      }
+
+      fiatReserve.balance -= fiatAmount;
+      fiatReserve.totalConverted += fiatAmount;
+      fiatReserve.updatedAt = new Date();
+      await fiatReserve.save();
+
+      // Log reserve conversion
+      await ReserveTransaction.create({
+        currency: fiatCurrency,
+        type: "conversion",
+        amount: -fiatAmount,
+        balanceBefore: balanceBeforeConversion,
+        balanceAfter: fiatReserve.balance,
+        relatedUserId: userId,
+        relatedTransactionId: transaction._id,
+        description: `Converted ${fiatAmount} ${fiatCurrency} → ${stablecoinAmount} ${stablecoin}`,
+        metadata: {
+          stablecoin,
+          stablecoinAmount,
+          conversionRate: realTimeRate,
+          conversionSource: conversion.source,
+        },
+      });
+
+      console.log(
+        `🔄 Conversion: -${fiatAmount} ${fiatCurrency} | Reserve Balance: ${fiatReserve.balance} ${fiatCurrency}`
+      );
+
+      // Check low balance alert
+      if (fiatReserve.balance < fiatReserve.lowBalanceThreshold) {
+        console.warn(
+          `⚠️ LOW RESERVE ALERT: ${fiatCurrency} reserve is ${fiatReserve.balance}, below threshold ${fiatReserve.lowBalanceThreshold}`
+        );
+      }
+
+      // STEP 3: Mint stablecoin to user wallet
+      const wallet = await Wallet.findOne({ userId });
+      if (wallet) {
+        wallet.balance += stablecoinAmount;
+        wallet.currency = stablecoin;
+        wallet.updatedAt = new Date();
+        await wallet.save();
+        console.log(`✅ Wallet updated: +${stablecoinAmount} ${stablecoin}`);
+      }
+
+      // Update transaction with real-time conversion details
       transaction.status = "completed";
+      transaction.amount = stablecoinAmount; // Store stablecoin amount
+      transaction.currency = stablecoin;
       transaction.paymentReference = mpesaReceiptNumber;
-      transaction.description += ` - M-Pesa Receipt: ${mpesaReceiptNumber}`;
+      transaction.description = `Deposit: ${fiatAmount} ${fiatCurrency} → ${stablecoinAmount} ${stablecoin} (Rate: ${realTimeRate})`;
+      transaction.metadata = {
+        ...transaction.metadata,
+        fiatAmount,
+        fiatCurrency,
+        stablecoin,
+        stablecoinAmount,
+        conversionRate: realTimeRate,
+        conversionSource: conversion.source,
+        conversionTimestamp: conversion.timestamp,
+        mpesaReceiptNumber,
+        realTimeConversion: true,
+      };
       await transaction.save();
 
       console.log(
-        `Wallet updated for user ${userId}, amount: ${transaction.amount}`
+        `🎉 Transaction completed: User ${userId} received ${stablecoinAmount} ${stablecoin}`
       );
     } else {
       // Payment failed - update transaction status
@@ -269,7 +410,7 @@ router.get("/yellowcard/currencies", (req, res) => {
   }
 });
 
-// Convert fiat deposit to stablecoin using Yellow Card
+// Convert fiat deposit to stablecoin using Yellow Card (REAL-TIME)
 router.post("/deposit/fiat-to-stablecoin", async (req, res) => {
   try {
     const {
@@ -287,17 +428,21 @@ router.post("/deposit/fiat-to-stablecoin", async (req, res) => {
       });
     }
 
-    // Get conversion rate and calculate stablecoin amount
-    const conversion = await convertFiatToStablecoin(
+    console.log(
+      `🟡 Initiating deposit: ${fiatAmount} ${fiatCurrency} → ${stablecoin}`
+    );
+
+    // Get CURRENT real-time conversion rate for display to user
+    const previewConversion = await convertFiatToStablecoin(
       fiatAmount,
       fiatCurrency,
       stablecoin
     );
 
-    if (!conversion.success) {
+    if (!previewConversion.success) {
       return res.status(400).json({
-        error: "Conversion failed",
-        details: conversion,
+        error: "Unable to fetch conversion rate",
+        details: previewConversion,
       });
     }
 
@@ -307,46 +452,51 @@ router.post("/deposit/fiat-to-stablecoin", async (req, res) => {
       return res.status(404).json({ error: "Wallet not found" });
     }
 
-    // Create deposit transaction with conversion details
+    // Create pending transaction with metadata for real-time conversion on callback
+    // NOTE: We store estimated amount, but ACTUAL conversion happens at payment time
     const transaction = await Transaction.create({
       userId,
       type: "deposit",
-      amount: conversion.stablecoinAmount, // Amount in stablecoin
+      amount: previewConversion.stablecoinAmount, // Estimated amount (will be updated)
       currency: stablecoin,
-      status: "pending", // Will be updated by M-Pesa callback
+      status: "pending", // Will be converted in real-time when callback is received
       paymentMethod,
-      description: `Deposit ${fiatAmount} ${fiatCurrency} → ${conversion.stablecoinAmount} ${stablecoin} (Rate: ${conversion.rate})`,
+      description: `Pending deposit: ${fiatAmount} ${fiatCurrency} → ~${previewConversion.stablecoinAmount} ${stablecoin}`,
       sender: phone,
       metadata: {
         fiatAmount,
         fiatCurrency,
         stablecoin,
-        conversionRate: conversion.rate,
-        conversionSource: conversion.source,
-        conversionTimestamp: conversion.timestamp,
+        previewRate: previewConversion.rate, // Rate shown to user
+        previewAmount: previewConversion.stablecoinAmount,
+        previewSource: previewConversion.source,
+        previewTimestamp: previewConversion.timestamp,
+        realTimeConversion: true, // Flag to trigger real-time conversion on callback
       },
       createdAt: new Date(),
     });
 
-    console.log(`🟡 Yellow Card deposit initiated:`, {
+    console.log(`🟡 Deposit initiated (real-time conversion on payment):`, {
       userId,
       fiatAmount: `${fiatAmount} ${fiatCurrency}`,
-      stablecoinAmount: `${conversion.stablecoinAmount} ${stablecoin}`,
-      rate: conversion.rate,
+      estimatedStablecoin: `~${previewConversion.stablecoinAmount} ${stablecoin}`,
+      previewRate: previewConversion.rate,
       transactionId: transaction._id.toString(),
+      note: "Actual amount will be calculated at payment time using live rates",
     });
 
     res.json({
       success: true,
       transactionId: transaction._id.toString(),
       message:
-        "Deposit initiated. Please complete M-Pesa payment on your phone.",
+        "Deposit initiated. Complete M-Pesa payment. Final amount calculated at payment time using real-time rates.",
       fiatAmount,
       fiatCurrency,
-      stablecoinAmount: conversion.stablecoinAmount,
+      estimatedStablecoinAmount: previewConversion.stablecoinAmount,
       stablecoin,
-      conversionRate: conversion.rate,
-      conversionSource: conversion.source,
+      previewRate: previewConversion.rate,
+      conversionSource: previewConversion.source,
+      note: "Final stablecoin amount will be calculated using live rates when payment is confirmed",
     });
   } catch (error) {
     console.error("Yellow Card deposit error:", error);
@@ -448,6 +598,106 @@ router.post("/withdraw/stablecoin-to-fiat", async (req, res) => {
     });
   } catch (error) {
     console.error("Yellow Card withdrawal error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get fiat reserve status
+router.get("/reserve/status", async (req, res) => {
+  try {
+    const { currency } = req.query;
+
+    if (currency) {
+      // Get specific currency reserve
+      const reserve = await FiatReserve.findOne({
+        currency: currency.toUpperCase(),
+      });
+      if (!reserve) {
+        return res
+          .status(404)
+          .json({ error: `Reserve for ${currency} not found` });
+      }
+      return res.json(reserve);
+    }
+
+    // Get all reserves
+    const reserves = await FiatReserve.find();
+    res.json(reserves);
+  } catch (error) {
+    console.error("Error fetching reserve status:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get reserve transaction history
+router.get("/reserve/transactions", async (req, res) => {
+  try {
+    const { currency, type, limit = 50 } = req.query;
+
+    const filter = {};
+    if (currency) filter.currency = currency.toUpperCase();
+    if (type) filter.type = type;
+
+    const transactions = await ReserveTransaction.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .populate("relatedUserId", "name phone")
+      .lean();
+
+    res.json(transactions);
+  } catch (error) {
+    console.error("Error fetching reserve transactions:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Initialize reserve (admin only - for setup)
+router.post("/reserve/initialize", async (req, res) => {
+  try {
+    const {
+      currency,
+      initialBalance = 0,
+      lowBalanceThreshold = 10000,
+    } = req.body;
+
+    if (!currency) {
+      return res.status(400).json({ error: "currency is required" });
+    }
+
+    const existing = await FiatReserve.findOne({
+      currency: currency.toUpperCase(),
+    });
+    if (existing) {
+      return res
+        .status(400)
+        .json({ error: `Reserve for ${currency} already exists` });
+    }
+
+    const reserve = await FiatReserve.create({
+      currency: currency.toUpperCase(),
+      balance: initialBalance,
+      totalDeposited: initialBalance,
+      lowBalanceThreshold,
+    });
+
+    if (initialBalance > 0) {
+      await ReserveTransaction.create({
+        currency: currency.toUpperCase(),
+        type: "adjustment",
+        amount: initialBalance,
+        balanceBefore: 0,
+        balanceAfter: initialBalance,
+        description: "Initial reserve setup",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Reserve initialized for ${currency}`,
+      reserve,
+    });
+  } catch (error) {
+    console.error("Error initializing reserve:", error);
     res.status(500).json({ error: error.message });
   }
 });

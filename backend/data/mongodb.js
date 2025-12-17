@@ -132,6 +132,40 @@ const cardSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
 });
 
+// Fiat Reserve Schema - Tracks fiat currency in M-Pesa till
+const fiatReserveSchema = new mongoose.Schema({
+  currency: { type: String, required: true, unique: true }, // KES, NGN, etc.
+  balance: { type: Number, default: 0 }, // Total fiat in reserve (M-Pesa till)
+  totalDeposited: { type: Number, default: 0 }, // Lifetime deposits received
+  totalConverted: { type: Number, default: 0 }, // Lifetime fiat converted to crypto
+  totalWithdrawn: { type: Number, default: 0 }, // Lifetime withdrawals sent out
+  lastActivity: { type: Date, default: Date.now },
+  lowBalanceThreshold: { type: Number, default: 10000 }, // Alert threshold
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+// Reserve Transaction Log - Audit trail for reserve movements
+const reserveTransactionSchema = new mongoose.Schema({
+  currency: { type: String, required: true },
+  type: {
+    type: String,
+    required: true,
+    enum: ["deposit", "conversion", "withdrawal", "adjustment"],
+  }, // deposit = fiat coming in, conversion = fiat → crypto, withdrawal = fiat going out
+  amount: { type: Number, required: true },
+  balanceBefore: { type: Number, required: true },
+  balanceAfter: { type: Number, required: true },
+  relatedUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  relatedTransactionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Transaction",
+  },
+  description: String,
+  metadata: mongoose.Schema.Types.Mixed,
+  createdAt: { type: Date, default: Date.now },
+});
+
 // Export models
 export const User = mongoose.model("User", userSchema);
 export const Wallet = mongoose.model("Wallet", walletSchema);
@@ -141,3 +175,8 @@ export const Claim = mongoose.model("Claim", claimSchema);
 export const ExchangeRate = mongoose.model("ExchangeRate", exchangeRateSchema);
 export const BankAccount = mongoose.model("BankAccount", bankAccountSchema);
 export const Card = mongoose.model("Card", cardSchema);
+export const FiatReserve = mongoose.model("FiatReserve", fiatReserveSchema);
+export const ReserveTransaction = mongoose.model(
+  "ReserveTransaction",
+  reserveTransactionSchema
+);

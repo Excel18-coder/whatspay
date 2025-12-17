@@ -6,6 +6,14 @@ const YELLOWCARD_API_URL =
 const YELLOWCARD_API_KEY = process.env.YELLOWCARD_API_KEY;
 const YELLOWCARD_SECRET = process.env.YELLOWCARD_SECRET;
 
+// In-memory rate cache for performance (rates updated every 30 seconds)
+let rateCache = {
+  rates: null,
+  timestamp: null,
+  source: null,
+};
+const CACHE_DURATION_MS = 30 * 1000; // 30 seconds - ensures fresh rates
+
 /**
  * Get Yellow Card authentication headers
  */
@@ -22,13 +30,37 @@ function getYellowCardHeaders() {
 }
 
 /**
- * Fetch real-time crypto buy/sell rates from Yellow Card
+ * Fetch real-time crypto buy/sell rates from Yellow Card with smart caching
+ * Caches rates for 30 seconds to reduce API calls while maintaining freshness
  * Supports conversion from fiat (KES, NGN, etc.) to crypto (USDT, USDC, cUSDC)
+ * @param {boolean} forceRefresh - Force fetch fresh rates ignoring cache
  * @returns {Promise<Object>} Rates object with buy/sell prices
  */
-export async function fetchYellowCardRates() {
+export async function fetchYellowCardRates(forceRefresh = false) {
+  // Check cache first (unless force refresh)
+  if (
+    !forceRefresh &&
+    rateCache.rates &&
+    rateCache.timestamp &&
+    Date.now() - rateCache.timestamp.getTime() < CACHE_DURATION_MS
+  ) {
+    const cacheAge = Math.round(
+      (Date.now() - rateCache.timestamp.getTime()) / 1000
+    );
+    console.log(
+      `💰 Using cached rates (${cacheAge}s old, source: ${rateCache.source})`
+    );
+    return {
+      success: true,
+      rates: rateCache.rates,
+      timestamp: rateCache.timestamp,
+      source: rateCache.source,
+      cached: true,
+    };
+  }
+
   try {
-    console.log("🟡 Fetching rates from Yellow Card API...");
+    console.log("🟡 Fetching FRESH rates from Yellow Card API...");
 
     const response = await axios.get(`${YELLOWCARD_API_URL}/rates`, {
       headers: getYellowCardHeaders(),
@@ -45,12 +77,20 @@ export async function fetchYellowCardRates() {
     //   "NGN": { ... }
     // }
 
-    console.log("✅ Yellow Card rates fetched successfully");
-    return {
-      success: true,
+    // Update cache
+    rateCache = {
       rates: response.data,
       timestamp: new Date(),
-      source: "YellowCard",
+      source: "YellowCard-Live",
+    };
+
+    console.log("✅ Yellow Card rates fetched and cached successfully");
+    return {
+      success: true,
+      rates: rateCache.rates,
+      timestamp: rateCache.timestamp,
+      source: rateCache.source,
+      cached: false,
     };
   } catch (error) {
     console.error("❌ Yellow Card API error:", error.message);
@@ -60,12 +100,21 @@ export async function fetchYellowCardRates() {
       console.error("Response data:", error.response.data);
     }
 
+    // Use fallback rates and cache them
+    const fallbackRates = getYellowCardFallbackRates();
+    rateCache = {
+      rates: fallbackRates,
+      timestamp: new Date(),
+      source: "Fallback",
+    };
+
     return {
       success: false,
       error: error.message,
-      rates: getYellowCardFallbackRates(),
-      timestamp: new Date(),
+      rates: fallbackRates,
+      timestamp: rateCache.timestamp,
       source: "Fallback",
+      cached: false,
     };
   }
 }
@@ -75,15 +124,17 @@ export async function fetchYellowCardRates() {
  * @param {string} fiatCurrency - Fiat currency code (KES, NGN, etc.)
  * @param {string} stablecoin - Stablecoin code (USDT, USDC, cUSDC)
  * @param {string} type - "buy" (user buying crypto) or "sell" (user selling crypto)
+ * @param {boolean} forceRefresh - Force fetch fresh rates for critical operations
  * @returns {Promise<Object>} Rate information
  */
 export async function getConversionRate(
   fiatCurrency,
   stablecoin,
-  type = "buy"
+  type = "buy",
+  forceRefresh = false
 ) {
   try {
-    const ratesData = await fetchYellowCardRates();
+    const ratesData = await fetchYellowCardRates(forceRefresh);
 
     if (!ratesData.success || !ratesData.rates[fiatCurrency]) {
       throw new Error(`Rates not available for ${fiatCurrency}`);
@@ -127,32 +178,41 @@ export async function getConversionRate(
 }
 
 /**
- * Convert fiat amount to stablecoin amount
+ * Convert fiat amount to stablecoin amount using REAL-TIME rates
  * @param {number} fiatAmount - Amount in fiat currency
  * @param {string} fiatCurrency - Fiat currency code
  * @param {string} stablecoin - Target stablecoin
+ * @param {boolean} forceRefresh - Force fresh rates for minting operations
  * @returns {Promise<Object>} Conversion result
  */
 export async function convertFiatToStablecoin(
   fiatAmount,
   fiatCurrency,
-  stablecoin
+  stablecoin,
+  forceRefresh = true // Default TRUE for minting - always use freshest rates
 ) {
   try {
+    const timestamp = new Date();
     console.log(
-      `🔄 Converting ${fiatAmount} ${fiatCurrency} to ${stablecoin}...`
+      `🔄 [${timestamp.toISOString()}] Converting ${fiatAmount} ${fiatCurrency} to ${stablecoin} (forceRefresh: ${forceRefresh})...`
     );
 
-    const rateInfo = await getConversionRate(fiatCurrency, stablecoin, "buy");
+    // Force refresh for accurate minting
+    const rateInfo = await getConversionRate(
+      fiatCurrency,
+      stablecoin,
+      "buy",
+      forceRefresh
+    );
 
     // User is buying crypto, so we use the buy rate
     // Amount in stablecoin = Fiat Amount / Buy Rate
     const stablecoinAmount = fiatAmount / rateInfo.rate;
 
+    const finalStablecoinAmount = parseFloat(stablecoinAmount.toFixed(6)); // 6 decimals precision
+
     console.log(
-      `✅ Conversion: ${fiatAmount} ${fiatCurrency} = ${stablecoinAmount.toFixed(
-        4
-      )} ${stablecoin}`
+      `✅ [MINT] ${fiatAmount} ${fiatCurrency} → ${finalStablecoinAmount} ${stablecoin} @ Rate: ${rateInfo.rate} (Source: ${rateInfo.source})`
     );
 
     return {
@@ -160,11 +220,12 @@ export async function convertFiatToStablecoin(
       fiatAmount,
       fiatCurrency,
       stablecoin,
-      stablecoinAmount: parseFloat(stablecoinAmount.toFixed(4)),
+      stablecoinAmount: finalStablecoinAmount,
       rate: rateInfo.rate,
       type: "buy",
-      timestamp: new Date(),
+      timestamp: timestamp,
       source: rateInfo.source,
+      cached: rateInfo.cached || false,
     };
   } catch (error) {
     console.error("Conversion error:", error.message);
